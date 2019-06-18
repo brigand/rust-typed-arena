@@ -66,6 +66,9 @@ extern crate alloc;
 #[cfg(any(feature = "std", test))]
 extern crate core;
 
+#[cfg(feature = "sync")]
+use std::sync::Mutex;
+
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
@@ -102,6 +105,18 @@ const MIN_CAPACITY: usize = 1;
 pub struct Arena<T> {
     chunks: RefCell<ChunkList<T>>,
 }
+
+
+/// An arena of objects of type `T` where we ensure Sync and Send.
+///
+/// This version of Arena uses a Mutex instead of RefCell, and as such is safe
+/// for use across multiple threads... I think.
+///
+#[cfg(feature = "sync")]
+pub struct ArenaSync<T> {
+    chunks: Mutex<ChunkList<T>>,
+}
+
 
 struct ChunkList<T> {
     current: Vec<T>,
@@ -331,6 +346,192 @@ impl<T> Default for Arena<T> {
         Self::new()
     }
 }
+
+
+#[cfg(feature = "sync")]
+impl<T: Send + Sync> ArenaSync<T> {
+    /// Construct a new arena.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use typed_arena::Arena;
+    ///
+    /// let arena = Arena::new();
+    /// # arena.alloc(1);
+    /// ```
+    pub fn new() -> Self {
+        let size = cmp::max(1, mem::size_of::<T>());
+        Self::with_capacity(INITIAL_SIZE / size)
+    }
+
+    /// Construct a new arena with capacity for `n` values pre-allocated.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use typed_arena::Arena;
+    ///
+    /// let arena = Arena::with_capacity(1337);
+    /// # arena.alloc(1);
+    /// ```
+    pub fn with_capacity(n: usize) -> Self {
+        let n = cmp::max(MIN_CAPACITY, n);
+        ArenaSync {
+            chunks: Mutex::new(ChunkList {
+                current: Vec::with_capacity(n),
+                rest: Vec::new(),
+            }),
+        }
+    }
+
+    /// Allocates a value in the arena, and returns a mutable reference
+    /// to that value.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use typed_arena::Arena;
+    ///
+    /// let arena = Arena::new();
+    /// let x = arena.alloc(42);
+    /// assert_eq!(*x, 42);
+    /// ```
+    #[inline]
+    pub fn alloc(&self, value: T) -> &mut T {
+        self.alloc_fast_path(value)
+            .unwrap_or_else(|value| self.alloc_slow_path(value))
+    }
+
+    #[inline]
+    fn alloc_fast_path(&self, value: T) -> Result<&mut T, T> {
+        let mut chunks = self.chunks.lock().unwrap();
+        if chunks.current.len() < chunks.current.capacity() {
+            chunks.current.push(value);
+            Ok(unsafe { mem::transmute(chunks.current.last_mut().unwrap()) })
+        } else {
+            Err(value)
+        }
+    }
+
+    fn alloc_slow_path(&self, value: T) -> &mut T {
+        &mut self.alloc_extend(iter::once(value))[0]
+    }
+
+    /// Uses the contents of an iterator to allocate values in the arena.
+    /// Returns a mutable slice that contains these values.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use typed_arena::Arena;
+    ///
+    /// let arena = Arena::new();
+    /// let abc = arena.alloc_extend("abcdefg".chars().take(3));
+    /// assert_eq!(abc, ['a', 'b', 'c']);
+    /// ```
+    pub fn alloc_extend<I>(&self, iterable: I) -> &mut [T]
+    where
+        I: IntoIterator<Item = T>,
+    {
+        let mut iter = iterable.into_iter();
+
+        let mut chunks = self.chunks.lock().unwrap();
+
+        let iter_min_len = iter.size_hint().0;
+        let mut next_item_index;
+        if chunks.current.len() + iter_min_len > chunks.current.capacity() {
+            chunks.reserve(iter_min_len);
+            chunks.current.extend(iter);
+            next_item_index = 0;
+        } else {
+            next_item_index = chunks.current.len();
+            let mut i = 0;
+            while let Some(elem) = iter.next() {
+                if chunks.current.len() == chunks.current.capacity() {
+                    // The iterator was larger than we could fit into the current chunk.
+                    let chunks = &mut *chunks;
+                    // Create a new chunk into which we can freely push the entire iterator into
+                    chunks.reserve(i + 1);
+                    let previous_chunk = chunks.rest.last_mut().unwrap();
+                    let previous_chunk_len = previous_chunk.len();
+                    // Move any elements we put into the previous chunk into this new chunk
+                    chunks
+                        .current
+                        .extend(previous_chunk.drain(previous_chunk_len - i..));
+                    chunks.current.push(elem);
+                    // And the remaining elements in the iterator
+                    chunks.current.extend(iter);
+                    next_item_index = 0;
+                    break;
+                } else {
+                    chunks.current.push(elem);
+                }
+                i += 1;
+            }
+        }
+        let new_slice_ref = {
+            let new_slice_ref = &mut chunks.current[next_item_index..];
+
+            // Extend the lifetime from that of `chunks_borrow` to that of `self`.
+            // This is OK because we’re careful to never move items
+            // by never pushing to inner `Vec`s beyond their initial capacity.
+            // The returned reference is unique (`&mut`):
+            // the `Arena` never gives away references to existing items.
+            unsafe { mem::transmute::<&mut [T], &mut [T]>(new_slice_ref) }
+        };
+
+        new_slice_ref
+    }
+
+    /// Allocates space for a given number of values, but doesn't initialize it.
+    ///
+    /// ## Unsafety and Undefined Behavior
+    ///
+    /// The same caveats that apply to
+    /// [`std::mem::uninitialized`](https://doc.rust-lang.org/nightly/std/mem/fn.uninitialized.html)
+    /// apply here:
+    ///
+    /// > **This is incredibly dangerous and should not be done lightly. Deeply
+    /// consider initializing your memory with a default value instead.**
+    ///
+    /// In particular, it is easy to trigger undefined behavior by allocating
+    /// uninitialized values, failing to properly initialize them, and then the
+    /// `Arena` will attempt to drop them when it is dropped. Initializing an
+    /// uninitialized value is trickier than it might seem: a normal assignment
+    /// to a field will attempt to drop the old, uninitialized value, which
+    /// almost certainly also triggers undefined behavior. You must also
+    /// consider all the places where your code might "unexpectedly" drop values
+    /// earlier than it "should" because of unwinding during panics.
+    pub unsafe fn alloc_uninitialized(&self, num: usize) -> *mut [T] {
+        let mut chunks = self.chunks.lock().unwrap();
+
+        if chunks.current.len() + num > chunks.current.capacity() {
+            chunks.reserve(num);
+        }
+
+        // At this point, the current chunk must have free capacity.
+        let next_item_index = chunks.current.len();
+        chunks.current.set_len(next_item_index + num);
+        // Extend the lifetime...
+        &mut chunks.current[next_item_index..] as *mut _
+    }
+
+    /// Returns unused space.
+    ///
+    /// *This unused space is still not considered "allocated".* Therefore, it
+    /// won't be dropped unless there are further calls to `alloc`,
+    /// `alloc_uninitialized`, or `alloc_extend` which is why the method is
+    /// safe.
+    pub fn uninitialized_array(&self) -> *mut [T] {
+        let chunks = self.chunks.lock().unwrap();
+        let len = chunks.current.capacity() - chunks.current.len();
+        let next_item_index = chunks.current.len();
+        let slice = &chunks.current[next_item_index..];
+        unsafe { slice::from_raw_parts_mut(slice.as_ptr() as *mut T, len) as *mut _ }
+    }
+}
+
 
 impl<T> ChunkList<T> {
     #[inline(never)]

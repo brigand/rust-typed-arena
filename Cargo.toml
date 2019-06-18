@@ -14,8 +14,9 @@ name = "typed_arena"
 path = "src/lib.rs"
 
 [features]
-default = ["std"]
+default = ["std", "sync"]
 std = []
+sync = []
 
 [dev-dependencies]
 criterion = "0.2.4"
